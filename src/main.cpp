@@ -85,6 +85,7 @@ struct Config {
   int pirTimeoutMinutes;
   int complianceWaitSeconds;  // Time to wait for user to stand before forcing
   bool beeperEnabled;
+  int positionChangeDelaySeconds;  // Time desk must stay at new height before confirming position change
 };
 
 Config config = {
@@ -99,7 +100,8 @@ Config config = {
   5000,    // relayDuration
   2,       // pirTimeoutMinutes (2 minutes default)
   30,      // complianceWaitSeconds (30 seconds default)
-  true     // beeperEnabled (true by default)
+  true,    // beeperEnabled (true by default)
+  5        // positionChangeDelaySeconds (5 seconds default)
 };
 
 // ==================== STATISTICS ====================
@@ -159,13 +161,16 @@ struct CurrentSession {
   bool isSitting;
   bool warningIssued;
   bool forcingStanding;  // Flag to prevent re-entry during forced standing
+  unsigned long positionChangeDetectedTime;  // When potential position change was first detected
+  bool pendingPositionChange;  // True if we're waiting to confirm a position change
+  bool pendingIsSitting;  // The pending position (true = sitting, false = standing)
 };
 
 DailyStats dailyStats = {0, 0, 0, 0, 0, 0, 0};
 WeeklyStats weeklyStats = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 MonthlyStats monthlyStats = {0, 0, 0, 0, 0, 0, 0, 0};
 YearlyStats yearlyStats = {0, 0, 0, 0, 0, 0, 0};
-CurrentSession session = {0, 0, 0, 0, 0, 0, 0, 0, false, false, false, false};
+CurrentSession session = {0, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false};
 
 // ==================== GLOBALS ====================
 WebServer server(80);
@@ -542,50 +547,89 @@ void checkPresence() {
 
 void checkDeskHeight() {
   float height = measureDeskHeight();
-  
+
   if (height <= 0) {
-    Serial.println("Invalid height measurement, skipping...");
+    Serial.println("Invalid height measurement - defaulting to sitting position");
+    // Default to sitting when measurement fails
+    height = config.sittingHeightCm;
+  }
+
+  // Determine what position the current height indicates
+  bool heightIndicatesSitting = (height <= (config.sittingHeightCm + config.heightTolerance));
+
+  // Check if this matches our current confirmed position
+  if (heightIndicatesSitting == session.isSitting) {
+    // Height matches current position - cancel any pending change
+    if (session.pendingPositionChange) {
+      session.pendingPositionChange = false;
+      Serial.println("Position change cancelled - height returned to current position");
+    }
+    return;  // No change needed
+  }
+
+  // Height indicates a different position than current
+  // Check if we're already tracking a pending change
+  if (!session.pendingPositionChange) {
+    // Start tracking a new pending position change
+    session.pendingPositionChange = true;
+    session.pendingIsSitting = heightIndicatesSitting;
+    session.positionChangeDetectedTime = millis();
+    Serial.printf("Potential position change detected: %s -> %s (waiting %d seconds)\n",
+                  session.isSitting ? "SITTING" : "STANDING",
+                  heightIndicatesSitting ? "SITTING" : "STANDING",
+                  config.positionChangeDelaySeconds);
     return;
   }
-  
+
+  // We have a pending change - check if position is still consistent
+  if (session.pendingIsSitting != heightIndicatesSitting) {
+    // Position changed again - restart the timer
+    session.pendingIsSitting = heightIndicatesSitting;
+    session.positionChangeDetectedTime = millis();
+    Serial.printf("Pending position changed - restarting timer for: %s\n",
+                  heightIndicatesSitting ? "SITTING" : "STANDING");
+    return;
+  }
+
+  // Check if enough time has elapsed
+  unsigned long elapsed = (millis() - session.positionChangeDetectedTime) / 1000;
+  if (elapsed < config.positionChangeDelaySeconds) {
+    // Still waiting for confirmation
+    return;
+  }
+
+  // Delay has elapsed - confirm the position change
+  session.pendingPositionChange = false;
   bool wasSitting = session.isSitting;
-  
-  if (abs(height - config.sittingHeightCm) <= config.heightTolerance) {
-    session.isSitting = true;
+  session.isSitting = heightIndicatesSitting;
 
-    if (!wasSitting && session.standingStartTime > 0) {
-      // Transitioned from standing to sitting - accumulate standing time and reset warning
-      unsigned long standingDuration = (millis() - session.standingStartTime) / 1000;
-      session.totalSessionStanding += standingDuration;
-      Serial.println("=== Position change: STANDING -> SITTING ===");
-      Serial.printf("Accumulated standing time: %s\n", formatDurationShort(standingDuration).c_str());
+  if (session.isSitting && !wasSitting && session.standingStartTime > 0) {
+    // Transitioned from standing to sitting - accumulate standing time and reset warning
+    unsigned long standingDuration = (millis() - session.standingStartTime) / 1000;
+    session.totalSessionStanding += standingDuration;
+    Serial.println("=== Position change CONFIRMED: STANDING -> SITTING ===");
+    Serial.printf("Accumulated standing time: %s\n", formatDurationShort(standingDuration).c_str());
+    session.sittingStartTime = millis();
+    session.standingStartTime = 0;
+    // Reset warning for new sitting period
+    session.warningIssued = false;
+  } else if (!session.isSitting && wasSitting && session.sittingStartTime > 0) {
+    // Transitioned from sitting to standing - accumulate sitting time
+    unsigned long sittingDuration = (millis() - session.sittingStartTime) / 1000;
+    session.totalSessionSitting += sittingDuration;
+    Serial.println("=== Position change CONFIRMED: SITTING -> STANDING ===");
+    Serial.printf("Accumulated sitting time: %s\n", formatDurationShort(sittingDuration).c_str());
+    session.standingStartTime = millis();
+    session.sittingStartTime = 0;
+    // Reset warningIssued when user voluntarily stands (clears the sitting timeout warning)
+    session.warningIssued = false;
+  } else if (session.sittingStartTime == 0 && session.standingStartTime == 0) {
+    // First detection of position
+    Serial.printf("=== Initial position CONFIRMED: %s ===\n", session.isSitting ? "SITTING" : "STANDING");
+    if (session.isSitting) {
       session.sittingStartTime = millis();
       session.standingStartTime = 0;
-      // Reset warning for new sitting period
-      session.warningIssued = false;
-    } else if (session.sittingStartTime == 0) {
-      // First detection as sitting
-      Serial.println("=== Initial position: SITTING ===");
-      session.sittingStartTime = millis();
-      session.standingStartTime = 0;
-    }
-
-  } else if (abs(height - config.standingHeightCm) <= config.heightTolerance) {
-    session.isSitting = false;
-
-    if (wasSitting && session.sittingStartTime > 0) {
-      // Transitioned from sitting to standing - accumulate sitting time
-      unsigned long sittingDuration = (millis() - session.sittingStartTime) / 1000;
-      session.totalSessionSitting += sittingDuration;
-      Serial.println("=== Position change: SITTING -> STANDING ===");
-      Serial.printf("Accumulated sitting time: %s\n", formatDurationShort(sittingDuration).c_str());
-      session.standingStartTime = millis();
-      session.sittingStartTime = 0;
-      // Reset warningIssued when user voluntarily stands (clears the sitting timeout warning)
-      session.warningIssued = false;
-    } else if (session.standingStartTime == 0) {
-      // First detection as standing
-      Serial.println("=== Initial position: STANDING ===");
+    } else {
       session.standingStartTime = millis();
       session.sittingStartTime = 0;
     }
@@ -1015,6 +1059,7 @@ void loadConfig() {
   config.pirTimeoutMinutes = preferences.getInt("pirTimeout", 2);
   config.complianceWaitSeconds = preferences.getInt("complianceWait", 30);
   config.beeperEnabled = preferences.getBool("beeperEnabled", true);
+  config.positionChangeDelaySeconds = preferences.getInt("posChangeDelay", 5);
 
   Serial.println("Configuration loaded from EEPROM");
 }
@@ -1032,6 +1077,7 @@ void saveConfig() {
   preferences.putInt("pirTimeout", config.pirTimeoutMinutes);
   preferences.putInt("complianceWait", config.complianceWaitSeconds);
   preferences.putBool("beeperEnabled", config.beeperEnabled);
+  preferences.putInt("posChangeDelay", config.positionChangeDelaySeconds);
 
   Serial.println("Configuration saved to EEPROM");
 }
@@ -1043,6 +1089,7 @@ void printCurrentConfig() {
   Serial.printf("Forced Standing Hours: %02d:00 - %02d:00\n",
                 config.operationStartHour, config.operationEndHour);
   Serial.printf("Compliance Wait: %d seconds\n", config.complianceWaitSeconds);
+  Serial.printf("Position Change Delay: %d seconds\n", config.positionChangeDelaySeconds);
   Serial.printf("Beeper: %s\n", config.beeperEnabled ? "ON" : "OFF");
   Serial.printf("Sitting Height: %.1f cm\n", config.sittingHeightCm);
   Serial.printf("Standing Height: %.1f cm\n", config.standingHeightCm);
@@ -1362,6 +1409,8 @@ void handleConfig() {
   html += "<p><em>Session ends after this many minutes of no motion</em></p>";
   html += "<p>Compliance Wait Time (sec): <input type='number' name='complianceWait' value='" + String(config.complianceWaitSeconds) + "'></p>";
   html += "<p><em>Time to wait for user to stand before forcing desk to raise</em></p>";
+  html += "<p>Position Change Delay (sec): <input type='number' name='posChangeDelay' value='" + String(config.positionChangeDelaySeconds) + "'></p>";
+  html += "<p><em>Time desk must stay at new height before confirming position change</em></p>";
   html += "<p>Forced Standing Start Hour (0-23): <input type='number' name='startHour' value='" + String(config.operationStartHour) + "'></p>";
   html += "<p>Forced Standing End Hour (0-23): <input type='number' name='endHour' value='" + String(config.operationEndHour) + "'></p>";
   html += "<p><em>Alerts and forced standing only happen during these hours. Stats are tracked 24/7.</em></p>";
@@ -1404,6 +1453,7 @@ void handleConfigSave() {
   if (server.hasArg("sitTimeout")) config.sitTimeout = server.arg("sitTimeout").toInt();
   if (server.hasArg("pirTimeout")) config.pirTimeoutMinutes = server.arg("pirTimeout").toInt();
   if (server.hasArg("complianceWait")) config.complianceWaitSeconds = server.arg("complianceWait").toInt();
+  if (server.hasArg("posChangeDelay")) config.positionChangeDelaySeconds = server.arg("posChangeDelay").toInt();
   if (server.hasArg("startHour")) config.operationStartHour = server.arg("startHour").toInt();
   if (server.hasArg("endHour")) config.operationEndHour = server.arg("endHour").toInt();
   if (server.hasArg("tolerance")) config.heightTolerance = server.arg("tolerance").toFloat();
