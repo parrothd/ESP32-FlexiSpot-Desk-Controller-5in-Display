@@ -540,6 +540,8 @@ void checkPresence() {
         session.sittingStartTime = 0;
         session.standingStartTime = 0;
         session.sessionStartTime = 0;
+        session.isSitting = false;  // Reset position to default
+        session.pendingPositionChange = false;  // Clear any pending changes
       }
     }
   }
@@ -564,6 +566,16 @@ void checkDeskHeight() {
       session.pendingPositionChange = false;
       Serial.println("Position change cancelled - height returned to current position");
     }
+
+    // Initialize timer if not already running (e.g., just returned from AWAY)
+    if (session.isSitting && session.sittingStartTime == 0) {
+      session.sittingStartTime = millis();
+      Serial.println("Initialized sitting timer (returning from AWAY in sitting position)");
+    } else if (!session.isSitting && session.standingStartTime == 0) {
+      session.standingStartTime = millis();
+      Serial.println("Initialized standing timer (returning from AWAY in standing position)");
+    }
+
     return;  // No change needed
   }
 
@@ -603,36 +615,40 @@ void checkDeskHeight() {
   bool wasSitting = session.isSitting;
   session.isSitting = heightIndicatesSitting;
 
-  if (session.isSitting && !wasSitting && session.standingStartTime > 0) {
-    // Transitioned from standing to sitting - accumulate standing time and reset warning
-    unsigned long standingDuration = (millis() - session.standingStartTime) / 1000;
-    session.totalSessionStanding += standingDuration;
-    Serial.println("=== Position change CONFIRMED: STANDING -> SITTING ===");
-    Serial.printf("Accumulated standing time: %s\n", formatDurationShort(standingDuration).c_str());
+  // Handle position change confirmation
+  if (session.isSitting) {
+    // Confirmed SITTING position
+    if (!wasSitting && session.standingStartTime > 0) {
+      // Transitioned from standing to sitting - accumulate standing time
+      unsigned long standingDuration = (millis() - session.standingStartTime) / 1000;
+      session.totalSessionStanding += standingDuration;
+      Serial.println("=== Position change CONFIRMED: STANDING -> SITTING ===");
+      Serial.printf("Accumulated standing time: %s\n", formatDurationShort(standingDuration).c_str());
+    } else {
+      // First time detecting sitting or no previous standing time tracked
+      Serial.println("=== Position CONFIRMED: SITTING ===");
+    }
+    // Always set sitting start time and clear standing
     session.sittingStartTime = millis();
     session.standingStartTime = 0;
-    // Reset warning for new sitting period
-    session.warningIssued = false;
-  } else if (!session.isSitting && wasSitting && session.sittingStartTime > 0) {
-    // Transitioned from sitting to standing - accumulate sitting time
-    unsigned long sittingDuration = (millis() - session.sittingStartTime) / 1000;
-    session.totalSessionSitting += sittingDuration;
-    Serial.println("=== Position change CONFIRMED: SITTING -> STANDING ===");
-    Serial.printf("Accumulated sitting time: %s\n", formatDurationShort(sittingDuration).c_str());
+    session.warningIssued = false;  // Reset warning for new sitting period
+
+  } else {
+    // Confirmed STANDING position
+    if (wasSitting && session.sittingStartTime > 0) {
+      // Transitioned from sitting to standing - accumulate sitting time
+      unsigned long sittingDuration = (millis() - session.sittingStartTime) / 1000;
+      session.totalSessionSitting += sittingDuration;
+      Serial.println("=== Position change CONFIRMED: SITTING -> STANDING ===");
+      Serial.printf("Accumulated sitting time: %s\n", formatDurationShort(sittingDuration).c_str());
+    } else {
+      // First time detecting standing or no previous sitting time tracked
+      Serial.println("=== Position CONFIRMED: STANDING ===");
+    }
+    // Always set standing start time and clear sitting
     session.standingStartTime = millis();
     session.sittingStartTime = 0;
-    // Reset warningIssued when user voluntarily stands (clears the sitting timeout warning)
-    session.warningIssued = false;
-  } else if (session.sittingStartTime == 0 && session.standingStartTime == 0) {
-    // First detection of position
-    Serial.printf("=== Initial position CONFIRMED: %s ===\n", session.isSitting ? "SITTING" : "STANDING");
-    if (session.isSitting) {
-      session.sittingStartTime = millis();
-      session.standingStartTime = 0;
-    } else {
-      session.standingStartTime = millis();
-      session.sittingStartTime = 0;
-    }
+    session.warningIssued = false;  // Reset warning when user voluntarily stands
   }
   
   if (config.debugMode) {
