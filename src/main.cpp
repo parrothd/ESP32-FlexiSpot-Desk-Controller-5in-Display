@@ -947,8 +947,16 @@ void checkWeekRollover() {
   time_t now = time(nullptr) + CST_OFFSET;
   struct tm timeinfo;
   gmtime_r(&now, &timeinfo);
-  
-  int currentWeek = (timeinfo.tm_yday / 7) + 1;
+
+  // Calculate Sunday-based week number
+  // tm_wday: 0=Sunday, 1=Monday, ..., 6=Saturday
+  // tm_yday: 0-365 (day of year, 0=Jan 1)
+  // First, figure out what day of week January 1st was
+  int jan1DayOfWeek = (7 + timeinfo.tm_wday - (timeinfo.tm_yday % 7)) % 7;
+  // Calculate which Sunday-based week we're in
+  // Week 1 includes Jan 1 through the first Saturday
+  // Week 2 starts on the first Sunday
+  int currentWeek = (timeinfo.tm_yday + jan1DayOfWeek) / 7 + 1;
   int currentYear = timeinfo.tm_year + 1900;
   int currentMonth = timeinfo.tm_mon + 1;
   
