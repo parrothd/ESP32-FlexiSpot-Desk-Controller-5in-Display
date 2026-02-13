@@ -6,6 +6,7 @@
 #include <time.h>
 #include <U8g2lib.h>
 #include <SPI.h>
+#include <ArduinoJson.h>
 
 // ==================== PIN DEFINITIONS ====================
 #define PASSIVE_BEEPER 26
@@ -70,6 +71,9 @@ void handleUpdateDailyStats();
 void handleTestBeep();
 void handleTestRelay();
 void handleTestStanding();
+void handleSensorUpdate();
+void handleNotFound();
+void handleResetAmazfit();
 
 // ==================== CONFIGURATION ====================
 struct Config {
@@ -179,6 +183,23 @@ WiFiManager wifiManager;
 
 // OLED Display
 U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI display(U8G2_R0, PIN_CS, PIN_DC, PIN_RST);
+
+// Amazfit sensor data
+int steps = 0;
+int calories = 0;
+float amazfitDistance = 0.0;
+int heartRate = 0;
+float weight = 0.0;
+bool amazfitConnected = false;
+String trigger_3 = "";
+String trigger_6 = "";
+String trigger_7 = "";
+String as_sensor = "";
+bool sleeping = false;
+String sleepState = "";
+int sleepDuration = 0;
+int battery = 0;
+int weeklyTotalSteps = 0;  // Accumulated steps from previous days this week
 
 unsigned long lastPirCheck = 0;
 unsigned long lastHeightCheck = 0;
@@ -419,11 +440,8 @@ void displayCurrentStats() {
           formatDurationShort(displayDailyStanding).c_str());
   display.drawStr(0, 36, buf);
   
-  // Line 4: Alerted/Forced/Ignored counts
-  sprintf(buf, "A:%d F:%d I:%d",
-          dailyStats.alertedCount,
-          dailyStats.forcedStandingCount,
-          dailyStats.ignoredWarningCount);
+  // Line 4: Steps
+  sprintf(buf, "Steps:%d", steps);
   display.drawStr(0, 49, buf);
   
   // === RIGHT COLUMN (Weekly) ===
@@ -432,21 +450,23 @@ void displayCurrentStats() {
           weeklyStats.month, weeklyStats.week);
   display.drawStr(128, 10, buf);
   
-  // Line 2: @Desk time
-  sprintf(buf, "@Desk %s", formatDurationShort(displayWeeklyDesk).c_str());
+  // Line 2: Average @Desk time per day this week
+  int daysThisWeek = timeinfo.tm_wday == 0 ? 7 : timeinfo.tm_wday;
+  unsigned long avgDeskPerDay = displayWeeklyDesk / daysThisWeek;
+  sprintf(buf, "@Desk %s/day", formatDurationShort(avgDeskPerDay).c_str());
   display.drawStr(128, 23, buf);
   
-  // Line 3: Sit vs Stand
-  sprintf(buf, "Sit:%s vs %s", 
-          formatDurationShort(displayWeeklySitting).c_str(),
-          formatDurationShort(displayWeeklyStanding).c_str());
+  // Line 3: Average Sit vs Stand per day
+  unsigned long avgSitPerDay = displayWeeklySitting / daysThisWeek;
+  unsigned long avgStandPerDay = displayWeeklyStanding / daysThisWeek;
+  sprintf(buf, "Sit:%s vs %s",
+          formatDurationShort(avgSitPerDay).c_str(),
+          formatDurationShort(avgStandPerDay).c_str());
   display.drawStr(128, 36, buf);
   
-  // Line 4: Alerted/Forced/Ignored counts
-  sprintf(buf, "A:%d F:%d I:%d",
-          weeklyStats.alertedCount,
-          weeklyStats.forcedStandingCount,
-          weeklyStats.ignoredWarningCount);
+  // Line 4: Average steps per day this week (accumulated + today's)
+  int avgSteps = (weeklyTotalSteps + steps) / daysThisWeek;
+  sprintf(buf, "Avg:%d/day", avgSteps);
   display.drawStr(128, 49, buf);
   
   // === BOTTOM LINE (y=62) - Current status on left, Sit/graph/percentage on right ===
@@ -931,6 +951,11 @@ void checkDayRollover() {
   
   if (dailyStats.date != 0 && currentDate != dailyStats.date) {
     Serial.println("=== NEW DAY - Saving and resetting daily stats ===");
+    // Accumulate today's steps into weekly total before resetting
+    weeklyTotalSteps += steps;
+    Serial.printf("Added %d steps to weekly total (now %d)\n", steps, weeklyTotalSteps);
+    steps = 0;
+    Serial.println("Steps reset to 0 for new day");
     saveStats();
     resetDailyStats();
     dailyStats.date = currentDate;
@@ -1161,7 +1186,24 @@ void loadStats() {
   yearlyStats.forcedStandingCount = preferences.getInt("yearForced", 0);
   yearlyStats.ignoredWarningCount = preferences.getInt("yearIgnored", 0);
   yearlyStats.year = preferences.getInt("yearNum", 0);
-  
+
+  // Amazfit sensor data
+  steps = preferences.getInt("azSteps", 0);
+  calories = preferences.getInt("azCalories", 0);
+  amazfitDistance = preferences.getFloat("azDistance", 0.0);
+  heartRate = preferences.getInt("azHeartRate", 0);
+  weight = preferences.getFloat("azWeight", 0.0);
+  amazfitConnected = preferences.getBool("azConnected", false);
+  battery = preferences.getInt("azBattery", 0);
+  sleeping = preferences.getBool("azSleeping", false);
+  sleepState = preferences.getString("azSleepState", "");
+  sleepDuration = preferences.getInt("azSleepDur", 0);
+  trigger_3 = preferences.getString("azTrigger3", "");
+  trigger_6 = preferences.getString("azTrigger6", "");
+  trigger_7 = preferences.getString("azTrigger7", "");
+  as_sensor = preferences.getString("azAsSensor", "");
+  weeklyTotalSteps = preferences.getInt("weekSteps", 0);
+
   Serial.println("Statistics loaded from EEPROM");
 }
 
@@ -1204,7 +1246,24 @@ void saveStats() {
   preferences.putInt("yearForced", yearlyStats.forcedStandingCount);
   preferences.putInt("yearIgnored", yearlyStats.ignoredWarningCount);
   preferences.putInt("yearNum", yearlyStats.year);
-  
+
+  // Amazfit sensor data
+  preferences.putInt("azSteps", steps);
+  preferences.putInt("azCalories", calories);
+  preferences.putFloat("azDistance", amazfitDistance);
+  preferences.putInt("azHeartRate", heartRate);
+  preferences.putFloat("azWeight", weight);
+  preferences.putBool("azConnected", amazfitConnected);
+  preferences.putInt("azBattery", battery);
+  preferences.putBool("azSleeping", sleeping);
+  preferences.putString("azSleepState", sleepState);
+  preferences.putInt("azSleepDur", sleepDuration);
+  preferences.putString("azTrigger3", trigger_3);
+  preferences.putString("azTrigger6", trigger_6);
+  preferences.putString("azTrigger7", trigger_7);
+  preferences.putString("azAsSensor", as_sensor);
+  preferences.putInt("weekSteps", weeklyTotalSteps);
+
   Serial.println("Statistics saved to EEPROM");
 }
 
@@ -1225,6 +1284,7 @@ void resetWeeklyStats() {
   weeklyStats.alertedCount = 0;
   weeklyStats.forcedStandingCount = 0;
   weeklyStats.ignoredWarningCount = 0;
+  weeklyTotalSteps = 0;
   Serial.println("Weekly stats reset");
 }
 
@@ -1290,6 +1350,105 @@ void printCurrentStats() {
   Serial.println("========================\n");
 }
 
+// ==================== AMAZFIT SENSOR HANDLER ====================
+void handleSensorUpdate() {
+  String uri = server.uri();
+  Serial.printf("[HTTP POST] %s - Body length: %d\n", uri.c_str(), server.arg("plain").length());
+
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    Serial.printf("  JSON parse error: %s\n", error.c_str());
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+
+  String sensorName = "";
+  int amazfitPos = uri.indexOf("amazfit_");
+  if (amazfitPos != -1) {
+    sensorName = uri.substring(amazfitPos + 8);
+  }
+
+  String stateValue = doc["state"].as<String>();
+
+  if (sensorName == "steps") {
+    steps = stateValue.toInt();
+    Serial.printf("  Steps: %d\n", steps);
+  }
+  else if (sensorName == "calories") {
+    calories = stateValue.toInt();
+    Serial.printf("  Calories: %d\n", calories);
+  }
+  else if (sensorName == "distance") {
+    amazfitDistance = stateValue.toFloat();
+    Serial.printf("  Distance: %.2f km\n", amazfitDistance);
+  }
+  else if (sensorName == "heartRate") {
+    heartRate = stateValue.toInt();
+    Serial.printf("  Heart Rate: %d bpm\n", heartRate);
+  }
+  else if (sensorName == "weight") {
+    weight = stateValue.toFloat();
+    Serial.printf("  Weight: %.1f kg\n", weight);
+  }
+  else if (sensorName == "connected") {
+    amazfitConnected = (stateValue == "true" || stateValue == "1" || stateValue == "on");
+    Serial.printf("  Connected: %s\n", amazfitConnected ? "Yes" : "No");
+  }
+  else if (sensorName == "trigger_3") {
+    trigger_3 = stateValue;
+    Serial.printf("  Trigger 3: %s\n", stateValue.c_str());
+  }
+  else if (sensorName == "trigger_6") {
+    trigger_6 = stateValue;
+    Serial.printf("  Trigger 6: %s\n", stateValue.c_str());
+  }
+  else if (sensorName == "trigger_7") {
+    trigger_7 = stateValue;
+    Serial.printf("  Trigger 7: %s\n", stateValue.c_str());
+  }
+  else if (sensorName == "as") {
+    as_sensor = stateValue;
+    Serial.printf("  AS: %s\n", stateValue.c_str());
+  }
+  else if (sensorName == "battery") {
+    battery = stateValue.toInt();
+    Serial.printf("  Battery: %d%%\n", battery);
+  }
+  else if (sensorName == "sleeping") {
+    sleeping = (stateValue == "true" || stateValue == "1" || stateValue == "on");
+    Serial.printf("  Sleeping: %s\n", sleeping ? "Yes" : "No");
+  }
+  else if (sensorName == "sleep") {
+    sleepState = stateValue;
+    Serial.printf("  Sleep State: %s\n", stateValue.c_str());
+  }
+  else if (sensorName == "sleepDuration") {
+    sleepDuration = stateValue.toInt();
+    Serial.printf("  Sleep Duration: %d min\n", sleepDuration);
+  }
+  else {
+    Serial.printf("  Unknown sensor: %s = %s\n", sensorName.c_str(), stateValue.c_str());
+  }
+
+  server.send(200, "application/json", "{\"state\":\"" + stateValue + "\"}");
+}
+
+void handleNotFound() {
+  Serial.printf("[HTTP %s] Unknown path: %s\n",
+    server.method() == HTTP_GET ? "GET" :
+    server.method() == HTTP_POST ? "POST" : "OTHER",
+    server.uri().c_str());
+  server.send(404, "text/plain", "Not Found");
+}
+
 // ==================== WEB SERVER ====================
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
@@ -1308,6 +1467,25 @@ void setupWebServer() {
   server.on("/test-beep", HTTP_POST, handleTestBeep);
   server.on("/test-relay", HTTP_POST, handleTestRelay);
   server.on("/test-standing", HTTP_POST, handleTestStanding);
+  server.on("/reset-amazfit", HTTP_POST, handleResetAmazfit);
+
+  // Amazfit sensor endpoints
+  server.on("/api/states/sensor.amazfit_steps", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_calories", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_distance", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_heartRate", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_weight", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_connected", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_battery", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_sleeping", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_sleep", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_sleepDuration", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_trigger_3", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_trigger_6", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_trigger_7", HTTP_POST, handleSensorUpdate);
+  server.on("/api/states/sensor.amazfit_as", HTTP_POST, handleSensorUpdate);
+
+  server.onNotFound(handleNotFound);
 }
 
 void handleRoot() {
@@ -1413,6 +1591,23 @@ void handleRoot() {
   html += "Ignored: " + String(yearlyStats.ignoredWarningCount) + "</p>";
   
   html += "<hr>";
+  html += "<h2>Amazfit Fitness Data</h2>";
+  html += "<p>Steps: " + String(steps) + "</p>";
+  html += "<p>Calories: " + String(calories) + "</p>";
+  html += "<p>Distance: " + String(amazfitDistance, 2) + " km</p>";
+  html += "<p>Heart Rate: " + String(heartRate) + " bpm</p>";
+  html += "<p>Weight: " + String(weight, 1) + " kg</p>";
+  html += "<p>Connected: " + String(amazfitConnected ? "Yes" : "No") + "</p>";
+  html += "<p>Battery: " + String(battery) + "%</p>";
+  html += "<p>Sleeping: " + String(sleeping ? "Yes" : "No") + "</p>";
+  html += "<p>Sleep State: " + sleepState + "</p>";
+  html += "<p>Sleep Duration: " + String(sleepDuration) + " min</p>";
+  html += "<p>Trigger 3: " + trigger_3 + "</p>";
+  html += "<p>Trigger 6: " + trigger_6 + "</p>";
+  html += "<p>Trigger 7: " + trigger_7 + "</p>";
+  html += "<p>AS Sensor: " + as_sensor + "</p>";
+
+  html += "<hr>";
   html += "<p><a href='/config'>Configuration</a> | ";
   html += "<a href='/calibrate'>Calibrate</a> | ";
   html += "<a href='/'>Refresh</a></p>";
@@ -1465,6 +1660,7 @@ void handleConfig() {
   html += "<form method='POST' action='/reset-weekly'><input type='submit' value='Reset Weekly Stats' onclick=\"return confirm('Reset this week\\'s stats?')\"></form>";
   html += "<form method='POST' action='/reset-monthly'><input type='submit' value='Reset Monthly Stats' onclick=\"return confirm('Reset this month\\'s stats?')\"></form>";
   html += "<form method='POST' action='/reset-yearly'><input type='submit' value='Reset Yearly Stats' onclick=\"return confirm('Reset this year\\'s stats?')\"></form>";
+  html += "<form method='POST' action='/reset-amazfit'><input type='submit' value='Reset Amazfit Data' onclick=\"return confirm('Reset all Amazfit sensor data?')\"></form>";
   html += "<form method='POST' action='/reset-all-stats'><input type='submit' value='Reset ALL Stats' style='background:red;color:white' onclick=\"return confirm('Reset ALL statistics? This cannot be undone!')\"></form>";
   
   html += "<hr><p><a href='/'>Home</a></p>";
@@ -1576,7 +1772,21 @@ void handleStats() {
   json += "\"yearlyStanding\":" + String(yearlyStats.totalStanding) + ",";
   json += "\"yearlyAlerted\":" + String(yearlyStats.alertedCount) + ",";
   json += "\"yearlyForced\":" + String(yearlyStats.forcedStandingCount) + ",";
-  json += "\"yearlyIgnored\":" + String(yearlyStats.ignoredWarningCount);
+  json += "\"yearlyIgnored\":" + String(yearlyStats.ignoredWarningCount) + ",";
+  json += "\"steps\":" + String(steps) + ",";
+  json += "\"calories\":" + String(calories) + ",";
+  json += "\"distance\":" + String(amazfitDistance, 2) + ",";
+  json += "\"heartRate\":" + String(heartRate) + ",";
+  json += "\"weight\":" + String(weight, 1) + ",";
+  json += "\"amazfitConnected\":" + String(amazfitConnected ? "true" : "false") + ",";
+  json += "\"battery\":" + String(battery) + ",";
+  json += "\"sleeping\":" + String(sleeping ? "true" : "false") + ",";
+  json += "\"sleepState\":\"" + sleepState + "\",";
+  json += "\"sleepDuration\":" + String(sleepDuration) + ",";
+  json += "\"trigger_3\":\"" + trigger_3 + "\",";
+  json += "\"trigger_6\":\"" + trigger_6 + "\",";
+  json += "\"trigger_7\":\"" + trigger_7 + "\",";
+  json += "\"as_sensor\":\"" + as_sensor + "\"";
   json += "}";
 
   server.send(200, "application/json", json);
@@ -1616,6 +1826,28 @@ void handleResetMonthly() {
 void handleResetYearly() {
   resetYearlyStats();
   saveStats();
+
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleResetAmazfit() {
+  steps = 0;
+  calories = 0;
+  amazfitDistance = 0.0;
+  heartRate = 0;
+  weight = 0.0;
+  amazfitConnected = false;
+  battery = 0;
+  sleeping = false;
+  sleepState = "";
+  sleepDuration = 0;
+  trigger_3 = "";
+  trigger_6 = "";
+  trigger_7 = "";
+  as_sensor = "";
+  saveStats();
+  Serial.println("Amazfit sensor data reset");
 
   server.sendHeader("Location", "/config");
   server.send(303);
