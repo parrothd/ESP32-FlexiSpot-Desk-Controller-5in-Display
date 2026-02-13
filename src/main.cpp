@@ -10,19 +10,23 @@
 
 // ==================== PIN DEFINITIONS ====================
 #define PASSIVE_BEEPER 26
-#define RELAY_PIN 27
 #define PIR_PIN 25
-#define TRIG_PIN 33
-#define ECHO_PIN 32
 
 // OLED Display (SSD1322 SPI)
 #define SCREEN_WIDTH 256
 #define SCREEN_HEIGHT 64
 #define PIN_CS 5       // /CS
-#define PIN_DC 16      // D/C
-#define PIN_RST 17     // /RES
+#define PIN_DC 27      // D/C (moved from GPIO16 to free UART2)
+#define PIN_RST 33     // /RES (moved from GPIO17 to free UART2)
 #define PIN_CLK 18     // SCLK
 #define PIN_MOSI 23    // SDIN
+
+// Loctek ET201-75W Desk Controller (UART via RJ45 bypass)
+// NOTE: GPIO16/17 cannot be used on ESP32-WROVER (PSRAM conflict)
+#define DESK_UART_RX 14   // GPIO14 - receives height data from controller (RJ45 pin 5)
+#define DESK_UART_TX 13   // GPIO13 - sends commands to controller (RJ45 pin 6)
+#define KEYPAD_RX 4        // GPIO4 - monitors keypad button presses (RJ45 pin 6)
+#define LOCTEK_PIN20 12    // GPIO12 - RJ45 pin 20 (controller screen enable, active HIGH)
 
 // ==================== FORWARD DECLARATIONS ====================
 void loadConfig();
@@ -47,6 +51,19 @@ void checkMonthRollover();
 void checkYearRollover();
 void beep(int duration);
 float measureDeskHeight();
+void initLoctekUART();
+void sendLoctekCommand(const uint8_t* cmd, size_t len);
+void sendDeskWake();
+void sendDeskUp();
+void sendDeskDown();
+void sendDeskStop();
+void sendDeskPreset(int preset);
+void readDeskHeight();
+float decodeLoctekHeight(uint8_t d1, uint8_t d2, uint8_t d3);
+void handleDeskUp();
+void handleDeskDown();
+void handleDeskStop();
+void handleDeskPreset();
 String formatDuration(unsigned long seconds);
 String formatDurationShort(unsigned long seconds);
 String formatPercentage(unsigned long sit, unsigned long stand);
@@ -85,7 +102,6 @@ struct Config {
   float heightTolerance;
   bool debugMode;
   int beepDuration;
-  int relayDuration;
   int pirTimeoutMinutes;
   int complianceWaitSeconds;  // Time to wait for user to stand before forcing
   bool beeperEnabled;
@@ -101,7 +117,6 @@ Config config = {
   5.0,     // heightTolerance
   false,   // debugMode
   2000,    // beepDuration
-  5000,    // relayDuration
   2,       // pirTimeoutMinutes (2 minutes default)
   30,      // complianceWaitSeconds (30 seconds default)
   true,    // beeperEnabled (true by default)
@@ -176,6 +191,36 @@ MonthlyStats monthlyStats = {0, 0, 0, 0, 0, 0, 0, 0};
 YearlyStats yearlyStats = {0, 0, 0, 0, 0, 0, 0};
 CurrentSession session = {0, 0, 0, 0, 0, 0, 0, 0, false, false, false, false, 0, false, false};
 
+// ==================== LOCTEK PROTOCOL ====================
+// Seven-segment display encoding lookup (hex value -> digit)
+// The desk controller sends height as 3 bytes of seven-segment encoded digits
+const uint8_t SEVEN_SEG_DIGITS[] = {
+  0x3F, // 0
+  0x06, // 1
+  0x5B, // 2
+  0x4F, // 3
+  0x66, // 4
+  0x6D, // 5
+  0x7D, // 6
+  0x07, // 7
+  0x7F, // 8
+  0x6F, // 9
+};
+
+// Loctek command frames: start(9B) + len(06) + type(02) + payload(2) + checksum(2) + end(9D)
+const uint8_t CMD_WAKE[]     = {0x9b, 0x06, 0x02, 0x00, 0x00, 0x6c, 0xa1, 0x9d};
+const uint8_t CMD_UP[]       = {0x9b, 0x06, 0x02, 0x01, 0x00, 0xfc, 0xa0, 0x9d};
+const uint8_t CMD_DOWN[]     = {0x9b, 0x06, 0x02, 0x02, 0x00, 0x0c, 0xa0, 0x9d};
+const uint8_t CMD_PRESET_1[] = {0x9b, 0x06, 0x02, 0x04, 0x00, 0xac, 0xa3, 0x9d};
+const uint8_t CMD_PRESET_2[] = {0x9b, 0x06, 0x02, 0x08, 0x00, 0xac, 0xa6, 0x9d};
+const uint8_t CMD_PRESET_3[] = {0x9b, 0x06, 0x02, 0x10, 0x00, 0xac, 0xac, 0x9d};  // Stand
+const uint8_t CMD_PRESET_4[] = {0x9b, 0x06, 0x02, 0x00, 0x01, 0xac, 0x60, 0x9d};  // Sit
+const size_t CMD_LENGTH = 8;
+
+#define LOCTEK_BAUD 9600
+#define LOCTEK_FRAME_START 0x9b
+#define LOCTEK_FRAME_END 0x9d
+
 // ==================== GLOBALS ====================
 WebServer server(80);
 Preferences preferences;
@@ -183,6 +228,23 @@ WiFiManager wifiManager;
 
 // OLED Display
 U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI display(U8G2_R0, PIN_CS, PIN_DC, PIN_RST);
+
+// Loctek desk controller
+HardwareSerial deskSerial(2);   // UART2 for desk controller communication
+float loctekHeight = 0.0;      // Current desk height from controller (cm)
+unsigned long lastWakeCommand = 0;
+const unsigned long WAKE_INTERVAL = 15000;  // Send wake every 15s to keep height broadcasting
+uint8_t deskRxBuffer[20];      // Buffer for incoming desk controller data
+int deskRxIndex = 0;
+bool deskScreenActive = false;
+
+// UART debug tracking
+unsigned long uartBytesReceived = 0;    // Total bytes received on DESK_UART_RX
+unsigned long uartFramesReceived = 0;   // Complete frames parsed
+unsigned long uartValidHeights = 0;     // Valid height values decoded
+unsigned long lastUartByteTime = 0;     // millis() of last byte received
+unsigned long lastUartDebugPrint = 0;   // For periodic console debug output
+const unsigned long UART_DEBUG_INTERVAL = 10000; // Print UART status every 10s
 
 // Amazfit sensor data
 int steps = 0;
@@ -220,15 +282,17 @@ void setup() {
   Serial.println("Step 1: Initializing pins...");
 
   pinMode(PASSIVE_BEEPER, OUTPUT);
-  pinMode(RELAY_PIN, OUTPUT);
   pinMode(PIR_PIN, INPUT);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  
+  pinMode(LOCTEK_PIN20, OUTPUT);
+
   digitalWrite(PASSIVE_BEEPER, LOW);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(LOCTEK_PIN20, HIGH);  // Enable controller screen via RJ45 pin 20
   
   Serial.println("Step 2: Pins initialized");
+
+  // Initialize Loctek desk controller UART
+  initLoctekUART();
+  Serial.println("Step 2b: Loctek UART initialized");
 
   // Initialize OLED display
   Serial.println("Step 3: Initializing OLED display...");
@@ -303,9 +367,18 @@ void setup() {
 // ==================== MAIN LOOP ====================
 void loop() {
   server.handleClient();
-  
+
+  // Continuously read desk height data from Loctek controller
+  readDeskHeight();
+
   unsigned long currentMillis = millis();
-  
+
+  // Periodically send wake command to keep controller broadcasting height
+  if (currentMillis - lastWakeCommand >= WAKE_INTERVAL) {
+    lastWakeCommand = currentMillis;
+    sendDeskWake();
+  }
+
   if (currentMillis - lastPirCheck >= PIR_CHECK_INTERVAL) {
     lastPirCheck = currentMillis;
     checkPresence();
@@ -315,6 +388,17 @@ void loop() {
     lastHeightCheck = currentMillis;
     if (session.atDesk) {
       checkDeskHeight();
+    }
+  }
+
+  // Periodic UART debug status to serial console
+  if (currentMillis - lastUartDebugPrint >= UART_DEBUG_INTERVAL) {
+    lastUartDebugPrint = currentMillis;
+    unsigned long secsSinceLastByte = lastUartByteTime > 0 ? (currentMillis - lastUartByteTime) / 1000 : 0;
+    Serial.printf("[UART DEBUG] RX Pin: GPIO%d | Bytes: %lu | Frames: %lu | Valid Heights: %lu | Height: %.1f cm | Last byte: %lus ago\n",
+                  DESK_UART_RX, uartBytesReceived, uartFramesReceived, uartValidHeights, loctekHeight, secsSinceLastByte);
+    if (uartBytesReceived == 0) {
+      Serial.println("[UART DEBUG] WARNING: No bytes received on DESK_UART_RX - check wiring to RJ45 pin 5 / GPIO14");
     }
   }
   
@@ -767,11 +851,9 @@ void checkSittingTimeout() {
       }
     }
 
-    // Activate relay to raise desk
-    Serial.println("Activating relay to force standing position...");
-    digitalWrite(RELAY_PIN, HIGH);
-    delay(config.relayDuration);
-    digitalWrite(RELAY_PIN, LOW);
+    // Send Loctek preset 3 (stand) to raise desk
+    Serial.println("Sending Loctek stand command to force standing position...");
+    sendDeskPreset(3);
 
     // Increment forced standing count
     dailyStats.forcedStandingCount++;
@@ -874,21 +956,150 @@ void finalizeSession() {
 }
 
 float measureDeskHeight() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  
-  if (duration == 0) {
-    return -1.0;
+  // Returns the last height read from the Loctek controller via UART
+  if (loctekHeight > 0) {
+    return loctekHeight;
   }
-  
-  float distance = duration * 0.034 / 2;
-  
-  return distance;
+  return -1.0;
+}
+
+// ==================== LOCTEK DESK FUNCTIONS ====================
+void initLoctekUART() {
+  deskSerial.begin(LOCTEK_BAUD, SERIAL_8N1, DESK_UART_RX, DESK_UART_TX);
+  Serial.println("Loctek UART initialized (desk on UART2)");
+}
+
+void sendLoctekCommand(const uint8_t* cmd, size_t len) {
+  deskSerial.write(cmd, len);
+}
+
+void sendDeskWake() {
+  // Ensure PIN 20 is HIGH to keep controller screen active
+  if (!deskScreenActive) {
+    digitalWrite(LOCTEK_PIN20, HIGH);
+    deskScreenActive = true;
+    delay(100);
+  }
+  sendLoctekCommand(CMD_WAKE, CMD_LENGTH);
+  if (config.debugMode) {
+    Serial.println("[Loctek] Wake command sent");
+  }
+}
+
+void sendDeskUp() {
+  sendDeskWake();
+  delay(50);
+  sendLoctekCommand(CMD_UP, CMD_LENGTH);
+  Serial.println("[Loctek] Up command sent");
+}
+
+void sendDeskDown() {
+  sendDeskWake();
+  delay(50);
+  sendLoctekCommand(CMD_DOWN, CMD_LENGTH);
+  Serial.println("[Loctek] Down command sent");
+}
+
+void sendDeskStop() {
+  // Sending wake without a movement command effectively stops movement
+  sendLoctekCommand(CMD_WAKE, CMD_LENGTH);
+  Serial.println("[Loctek] Stop command sent");
+}
+
+void sendDeskPreset(int preset) {
+  sendDeskWake();
+  delay(50);
+  switch (preset) {
+    case 1: sendLoctekCommand(CMD_PRESET_1, CMD_LENGTH); break;
+    case 2: sendLoctekCommand(CMD_PRESET_2, CMD_LENGTH); break;
+    case 3: sendLoctekCommand(CMD_PRESET_3, CMD_LENGTH); break;  // Stand
+    case 4: sendLoctekCommand(CMD_PRESET_4, CMD_LENGTH); break;  // Sit
+    default: return;
+  }
+  Serial.printf("[Loctek] Preset %d command sent\n", preset);
+}
+
+int decodeSevenSeg(uint8_t seg) {
+  // Strip the decimal point bit (bit 7) before matching
+  uint8_t stripped = seg & 0x7F;
+  for (int i = 0; i <= 9; i++) {
+    if (SEVEN_SEG_DIGITS[i] == stripped) return i;
+  }
+  return -1;  // Unknown segment
+}
+
+bool hasDecimalPoint(uint8_t seg) {
+  return (seg & 0x80) != 0;
+}
+
+float decodeLoctekHeight(uint8_t d1, uint8_t d2, uint8_t d3) {
+  int digit1 = decodeSevenSeg(d1);
+  int digit2 = decodeSevenSeg(d2);
+  int digit3 = decodeSevenSeg(d3);
+
+  Serial.printf("[Loctek DECODE] raw: 0x%02X 0x%02X 0x%02X -> digits: %d %d %d | DP: %d %d %d\n",
+                d1, d2, d3, digit1, digit2, digit3,
+                hasDecimalPoint(d1), hasDecimalPoint(d2), hasDecimalPoint(d3));
+
+  if (digit1 < 0 || digit2 < 0 || digit3 < 0) {
+    return -1.0;  // Could not decode
+  }
+
+  // Find which digit has the decimal point
+  if (hasDecimalPoint(d1)) {
+    // D.DD format (unlikely but handle it)
+    return (float)digit1 + (float)(digit2 * 10 + digit3) / 100.0;
+  } else if (hasDecimalPoint(d2)) {
+    // DD.D format (e.g., 28.8 inches)
+    return (float)(digit1 * 10 + digit2) + (float)digit3 / 10.0;
+  } else {
+    // No decimal point: 3-digit number (e.g., 115 cm)
+    return (float)(digit1 * 100 + digit2 * 10 + digit3);
+  }
+}
+
+void readDeskHeight() {
+  while (deskSerial.available()) {
+    uint8_t b = deskSerial.read();
+    uartBytesReceived++;
+    lastUartByteTime = millis();
+
+    if (b == LOCTEK_FRAME_START) {
+      deskRxIndex = 0;
+      deskRxBuffer[deskRxIndex++] = b;
+    } else if (deskRxIndex > 0) {
+      if (deskRxIndex < sizeof(deskRxBuffer)) {
+        deskRxBuffer[deskRxIndex++] = b;
+      }
+
+      if (b == LOCTEK_FRAME_END) {
+        uartFramesReceived++;
+
+        // Dump raw frame hex for debugging (first 20 frames then every 100th)
+        if (uartFramesReceived <= 20 || uartFramesReceived % 100 == 0) {
+          Serial.printf("[Loctek RAW] Frame #%lu len=%d: ", uartFramesReceived, deskRxIndex);
+          for (int i = 0; i < deskRxIndex; i++) {
+            Serial.printf("%02X ", deskRxBuffer[i]);
+          }
+          Serial.println();
+        }
+
+        // Complete frame received - parse it
+        // Height data frames have length byte of 0x07 and 3 seven-seg display bytes
+        if (deskRxIndex >= 7 && deskRxBuffer[1] == 0x07 && deskRxBuffer[2] == 0x12) {
+          float height = decodeLoctekHeight(deskRxBuffer[3], deskRxBuffer[4], deskRxBuffer[5]);
+          if (height > 0) {
+            loctekHeight = height;
+            uartValidHeights++;
+            if (config.debugMode) {
+              Serial.printf("[Loctek] Height: %.1f cm\n", loctekHeight);
+            }
+          }
+        }
+        deskRxIndex = 0;  // Reset for next frame
+      }
+    }
+  }
 }
 
 void syncTime() {
@@ -1104,7 +1315,6 @@ void loadConfig() {
   config.heightTolerance = preferences.getFloat("tolerance", 5.0);
   config.debugMode = preferences.getBool("debugMode", false);
   config.beepDuration = preferences.getInt("beepDur", 2000);
-  config.relayDuration = preferences.getInt("relayDur", 5000);
   config.pirTimeoutMinutes = preferences.getInt("pirTimeout", 2);
   config.complianceWaitSeconds = preferences.getInt("complianceWait", 30);
   config.beeperEnabled = preferences.getBool("beeperEnabled", true);
@@ -1122,7 +1332,6 @@ void saveConfig() {
   preferences.putFloat("tolerance", config.heightTolerance);
   preferences.putBool("debugMode", config.debugMode);
   preferences.putInt("beepDur", config.beepDuration);
-  preferences.putInt("relayDur", config.relayDuration);
   preferences.putInt("pirTimeout", config.pirTimeoutMinutes);
   preferences.putInt("complianceWait", config.complianceWaitSeconds);
   preferences.putBool("beeperEnabled", config.beeperEnabled);
@@ -1467,6 +1676,10 @@ void setupWebServer() {
   server.on("/test-beep", HTTP_POST, handleTestBeep);
   server.on("/test-relay", HTTP_POST, handleTestRelay);
   server.on("/test-standing", HTTP_POST, handleTestStanding);
+  server.on("/desk-up", HTTP_POST, handleDeskUp);
+  server.on("/desk-down", HTTP_POST, handleDeskDown);
+  server.on("/desk-stop", HTTP_POST, handleDeskStop);
+  server.on("/desk-preset", HTTP_POST, handleDeskPreset);
   server.on("/reset-amazfit", HTTP_POST, handleResetAmazfit);
 
   // Amazfit sensor endpoints
@@ -1635,7 +1848,6 @@ void handleConfig() {
   html += "<p><em>Alerts and forced standing only happen during these hours. Stats are tracked 24/7.</em></p>";
   html += "<p>Height Tolerance (cm): <input type='number' step='0.1' name='tolerance' value='" + String(config.heightTolerance) + "'></p>";
   html += "<p>Beep Duration (ms): <input type='number' name='beepDur' value='" + String(config.beepDuration) + "'></p>";
-  html += "<p>Relay Duration (ms): <input type='number' name='relayDur' value='" + String(config.relayDuration) + "'></p>";
   html += "<p>Beeper Enabled: <select name='beeperEnabled'><option value='1' " + String(config.beeperEnabled ? "selected" : "") + ">ON</option><option value='0' " + String(!config.beeperEnabled ? "selected" : "") + ">OFF</option></select></p>";
   html += "<p>Debug Mode: <select name='debugMode'><option value='0'>OFF</option><option value='1' " + String(config.debugMode ? "selected" : "") + ">ON</option></select></p>";
   html += "<p><input type='submit' value='Save Configuration'></p>";
@@ -1650,9 +1862,30 @@ void handleConfig() {
   html += "<p><input type='submit' value='Update Daily Stats'></p>";
   html += "</form>";
 
+  html += "<hr><h2>Desk Control</h2>";
+  html += "<form method='POST' action='/desk-up' style='display:inline'><input type='submit' value='Desk Up'></form> ";
+  html += "<form method='POST' action='/desk-down' style='display:inline'><input type='submit' value='Desk Down'></form> ";
+  html += "<form method='POST' action='/desk-stop' style='display:inline'><input type='submit' value='Stop'></form>";
+  html += "<br><br>";
+  html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='1'><input type='submit' value='Preset 1'></form> ";
+  html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='2'><input type='submit' value='Preset 2'></form> ";
+  html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='3'><input type='submit' value='Preset 3 (Stand)'></form> ";
+  html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='4'><input type='submit' value='Preset 4 (Sit)'></form>";
+  html += "<p>Current Height: " + String(loctekHeight, 1) + " cm</p>";
+
+  // UART Debug Info
+  unsigned long secsSinceByte = lastUartByteTime > 0 ? (millis() - lastUartByteTime) / 1000 : 0;
+  html += "<hr><h2>UART Debug (GPIO" + String(DESK_UART_RX) + ")</h2>";
+  html += "<p>Bytes Received: <strong>" + String(uartBytesReceived) + "</strong></p>";
+  html += "<p>Frames Received: <strong>" + String(uartFramesReceived) + "</strong></p>";
+  html += "<p>Valid Heights Decoded: <strong>" + String(uartValidHeights) + "</strong></p>";
+  html += "<p>Last Byte Received: <strong>" + (lastUartByteTime > 0 ? String(secsSinceByte) + "s ago" : "Never") + "</strong></p>";
+  if (uartBytesReceived == 0) {
+    html += "<p style='color:red;font-weight:bold'>WARNING: No data received on RX pin - check wiring to RJ45 pin 5</p>";
+  }
+
   html += "<hr><h2>Test Functions</h2>";
   html += "<form method='POST' action='/test-beep'><input type='submit' value='Test Beep'></form>";
-  html += "<form method='POST' action='/test-relay'><input type='submit' value='Test Relay (2 sec)'></form>";
   html += "<form method='POST' action='/test-standing'><input type='submit' value='Test Force Standing'></form>";
   
   html += "<hr><h2>Reset Statistics</h2>";
@@ -1678,7 +1911,6 @@ void handleConfigSave() {
   if (server.hasArg("endHour")) config.operationEndHour = server.arg("endHour").toInt();
   if (server.hasArg("tolerance")) config.heightTolerance = server.arg("tolerance").toFloat();
   if (server.hasArg("beepDur")) config.beepDuration = server.arg("beepDur").toInt();
-  if (server.hasArg("relayDur")) config.relayDuration = server.arg("relayDur").toInt();
   if (server.hasArg("beeperEnabled")) config.beeperEnabled = server.arg("beeperEnabled").toInt() == 1;
   if (server.hasArg("debugMode")) config.debugMode = server.arg("debugMode").toInt() == 1;
 
@@ -1786,7 +2018,12 @@ void handleStats() {
   json += "\"trigger_3\":\"" + trigger_3 + "\",";
   json += "\"trigger_6\":\"" + trigger_6 + "\",";
   json += "\"trigger_7\":\"" + trigger_7 + "\",";
-  json += "\"as_sensor\":\"" + as_sensor + "\"";
+  json += "\"as_sensor\":\"" + as_sensor + "\",";
+  json += "\"deskHeight\":" + String(loctekHeight, 1) + ",";
+  json += "\"uartBytesReceived\":" + String(uartBytesReceived) + ",";
+  json += "\"uartFramesReceived\":" + String(uartFramesReceived) + ",";
+  json += "\"uartValidHeights\":" + String(uartValidHeights) + ",";
+  json += "\"uartLastByteSecsAgo\":" + String(lastUartByteTime > 0 ? (millis() - lastUartByteTime) / 1000 : 0);
   json += "}";
 
   server.send(200, "application/json", json);
@@ -1888,28 +2125,54 @@ void handleTestBeep() {
 }
 
 void handleTestRelay() {
-  digitalWrite(RELAY_PIN, HIGH);
-  delay(2000);
-  digitalWrite(RELAY_PIN, LOW);
-  
+  // Legacy endpoint - now sends desk up command
+  Serial.println("Test: Sending desk up command");
+  sendDeskUp();
+
   server.sendHeader("Location", "/config");
   server.send(303);
 }
 
 void handleTestStanding() {
   Serial.println("=== MANUAL STANDING TEST ===");
-  
+
   for (int i = 0; i < 3; i++) {
     beep(500);
     delay(200);
   }
-  
-  Serial.println("Activating relay for standing...");
-  digitalWrite(RELAY_PIN, HIGH);
-  delay(config.relayDuration);
-  digitalWrite(RELAY_PIN, LOW);
+
+  Serial.println("Sending Loctek stand preset...");
+  sendDeskPreset(3);
   Serial.println("Standing test complete");
-  
+
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskUp() {
+  sendDeskUp();
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskDown() {
+  sendDeskDown();
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskStop() {
+  sendDeskStop();
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskPreset() {
+  int preset = 1;
+  if (server.hasArg("preset")) {
+    preset = server.arg("preset").toInt();
+  }
+  sendDeskPreset(preset);
   server.sendHeader("Location", "/config");
   server.send(303);
 }
