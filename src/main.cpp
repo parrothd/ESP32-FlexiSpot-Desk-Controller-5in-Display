@@ -25,9 +25,15 @@
 // NOTE: GPIO16/17 cannot be used on ESP32-WROVER (PSRAM conflict)
 #define DESK_UART_RX 14   // GPIO14 - receives height data from controller (RJ45 pin 5)
 #define DESK_UART_TX 13   // GPIO13 - sends commands to controller (RJ45 pin 6)
-#define KEYPAD_RX 4        // GPIO4 - monitors keypad button presses (RJ45 pin 6)
 #define LOCTEK_PIN20 12    // GPIO12 - RJ45 pin 20 (controller screen enable, active HIGH)
-#define BUTTON_DOWN 22     // GPIO22 - physical button to lower desk (wire between GPIO and GND)
+
+// Physical buttons (wire each between GPIO and GND, internal pull-ups used)
+#define BUTTON_UP 4        // GPIO4
+#define BUTTON_DOWN 22     // GPIO22
+#define BUTTON_PRESET1 21  // GPIO21
+#define BUTTON_PRESET2 32  // GPIO32
+#define BUTTON_PRESET3 15  // GPIO15
+#define BUTTON_MEMORY 2    // GPIO2
 
 // ==================== FORWARD DECLARATIONS ====================
 void loadConfig();
@@ -65,6 +71,9 @@ void handleDeskUp();
 void handleDeskDown();
 void handleDeskStop();
 void handleDeskPreset();
+void handleDeskMemory();
+void handleDeskSetPreset();
+void checkButtons();
 String formatDuration(unsigned long seconds);
 String formatDurationShort(unsigned long seconds);
 String formatPercentage(unsigned long sit, unsigned long stand);
@@ -216,6 +225,7 @@ const uint8_t CMD_PRESET_1[] = {0x9b, 0x06, 0x02, 0x04, 0x00, 0xac, 0xa3, 0x9d};
 const uint8_t CMD_PRESET_2[] = {0x9b, 0x06, 0x02, 0x08, 0x00, 0xac, 0xa6, 0x9d};
 const uint8_t CMD_PRESET_3[] = {0x9b, 0x06, 0x02, 0x10, 0x00, 0xac, 0xac, 0x9d};  // Stand
 const uint8_t CMD_PRESET_4[] = {0x9b, 0x06, 0x02, 0x00, 0x01, 0xac, 0x60, 0x9d};  // Sit
+const uint8_t CMD_MEMORY[]   = {0x9b, 0x06, 0x02, 0x20, 0x00, 0xac, 0xb8, 0x9d};  // M (Memory) button
 const size_t CMD_LENGTH = 8;
 
 #define LOCTEK_BAUD 9600
@@ -285,7 +295,12 @@ void setup() {
   pinMode(PASSIVE_BEEPER, OUTPUT);
   pinMode(PIR_PIN, INPUT);
   pinMode(LOCTEK_PIN20, OUTPUT);
+  pinMode(BUTTON_UP, INPUT_PULLUP);
   pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  pinMode(BUTTON_PRESET1, INPUT_PULLUP);
+  pinMode(BUTTON_PRESET2, INPUT_PULLUP);
+  pinMode(BUTTON_PRESET3, INPUT_PULLUP);
+  pinMode(BUTTON_MEMORY, INPUT_PULLUP);
 
   digitalWrite(PASSIVE_BEEPER, LOW);
   digitalWrite(LOCTEK_PIN20, HIGH);  // Enable controller screen via RJ45 pin 20
@@ -366,6 +381,73 @@ void setup() {
   displayCurrentStats();
 }
 
+// ==================== BUTTON HANDLING ====================
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long REPEAT_MS = 150;  // Up/Down repeat rate while held
+unsigned long lastUpRepeat = 0;
+unsigned long lastDownRepeat = 0;
+bool prevUp = false, prevDown = false;
+bool prevPreset1 = false, prevPreset2 = false, prevPreset3 = false;
+bool prevMemory = false;
+
+bool debounceRead(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(DEBOUNCE_MS);
+    return (digitalRead(pin) == LOW);
+  }
+  return false;
+}
+
+void checkButtons() {
+  unsigned long now = millis();
+  bool curUp = debounceRead(BUTTON_UP);
+  bool curDown = debounceRead(BUTTON_DOWN);
+  bool curP1 = debounceRead(BUTTON_PRESET1);
+  bool curP2 = debounceRead(BUTTON_PRESET2);
+  bool curP3 = debounceRead(BUTTON_PRESET3);
+  bool curMem = debounceRead(BUTTON_MEMORY);
+
+  // Up - repeat while held
+  if (curUp && (now - lastUpRepeat >= REPEAT_MS)) {
+    sendLoctekCommand(CMD_UP, CMD_LENGTH);
+    Serial.println("[Button] Up");
+    lastUpRepeat = now;
+  }
+
+  // Down - repeat while held
+  if (curDown && (now - lastDownRepeat >= REPEAT_MS)) {
+    sendLoctekCommand(CMD_DOWN, CMD_LENGTH);
+    Serial.println("[Button] Down");
+    lastDownRepeat = now;
+  }
+
+  // Presets - trigger once on press
+  if (curP1 && !prevPreset1) {
+    sendDeskPreset(1);
+    Serial.println("[Button] Preset 1");
+  }
+  prevPreset1 = curP1;
+
+  if (curP2 && !prevPreset2) {
+    sendDeskPreset(2);
+    Serial.println("[Button] Preset 2");
+  }
+  prevPreset2 = curP2;
+
+  if (curP3 && !prevPreset3) {
+    sendDeskPreset(3);
+    Serial.println("[Button] Preset 3");
+  }
+  prevPreset3 = curP3;
+
+  // Memory - trigger once on press
+  if (curMem && !prevMemory) {
+    sendLoctekCommand(CMD_MEMORY, CMD_LENGTH);
+    Serial.println("[Button] Memory (M)");
+  }
+  prevMemory = curMem;
+}
+
 // ==================== MAIN LOOP ====================
 void loop() {
   server.handleClient();
@@ -373,10 +455,8 @@ void loop() {
   // Continuously read desk height data from Loctek controller
   readDeskHeight();
 
-  // Physical button on GPIO22 - lowers desk while held
-  if (digitalRead(BUTTON_DOWN) == LOW) {
-    sendLoctekCommand(CMD_DOWN, CMD_LENGTH);
-  }
+  // Physical buttons with debouncing
+  checkButtons();
 
   unsigned long currentMillis = millis();
 
@@ -398,15 +478,12 @@ void loop() {
     }
   }
 
-  // Periodic UART debug status to serial console
-  if (currentMillis - lastUartDebugPrint >= UART_DEBUG_INTERVAL) {
+  // Periodic UART debug (only when debug mode enabled)
+  if (config.debugMode && currentMillis - lastUartDebugPrint >= UART_DEBUG_INTERVAL) {
     lastUartDebugPrint = currentMillis;
     unsigned long secsSinceLastByte = lastUartByteTime > 0 ? (currentMillis - lastUartByteTime) / 1000 : 0;
-    Serial.printf("[UART DEBUG] RX Pin: GPIO%d | Bytes: %lu | Frames: %lu | Valid Heights: %lu | Height: %.1f cm | Last byte: %lus ago\n",
-                  DESK_UART_RX, uartBytesReceived, uartFramesReceived, uartValidHeights, loctekHeight, secsSinceLastByte);
-    if (uartBytesReceived == 0) {
-      Serial.println("[UART DEBUG] WARNING: No bytes received on DESK_UART_RX - check wiring to RJ45 pin 5 / GPIO14");
-    }
+    Serial.printf("[UART DEBUG] Bytes: %lu | Frames: %lu | Heights: %lu | Height: %.1f cm | Last: %lus ago\n",
+                  uartBytesReceived, uartFramesReceived, uartValidHeights, loctekHeight, secsSinceLastByte);
   }
   
   // Update session times every loop if at desk
@@ -1044,10 +1121,6 @@ float decodeLoctekHeight(uint8_t d1, uint8_t d2, uint8_t d3) {
   int digit2 = decodeSevenSeg(d2);
   int digit3 = decodeSevenSeg(d3);
 
-  Serial.printf("[Loctek DECODE] raw: 0x%02X 0x%02X 0x%02X -> digits: %d %d %d | DP: %d %d %d\n",
-                d1, d2, d3, digit1, digit2, digit3,
-                hasDecimalPoint(d1), hasDecimalPoint(d2), hasDecimalPoint(d3));
-
   if (digit1 < 0 || digit2 < 0 || digit3 < 0) {
     return -1.0;  // Could not decode
   }
@@ -1081,15 +1154,6 @@ void readDeskHeight() {
 
       if (b == LOCTEK_FRAME_END) {
         uartFramesReceived++;
-
-        // Dump raw frame hex for debugging (first 20 frames then every 100th)
-        if (uartFramesReceived <= 20 || uartFramesReceived % 100 == 0) {
-          Serial.printf("[Loctek RAW] Frame #%lu len=%d: ", uartFramesReceived, deskRxIndex);
-          for (int i = 0; i < deskRxIndex; i++) {
-            Serial.printf("%02X ", deskRxBuffer[i]);
-          }
-          Serial.println();
-        }
 
         // Complete frame received - parse it
         // Height data frames have length byte of 0x07 and 3 seven-seg display bytes
@@ -1687,6 +1751,8 @@ void setupWebServer() {
   server.on("/desk-down", HTTP_POST, handleDeskDown);
   server.on("/desk-stop", HTTP_POST, handleDeskStop);
   server.on("/desk-preset", HTTP_POST, handleDeskPreset);
+  server.on("/desk-memory", HTTP_POST, handleDeskMemory);
+  server.on("/desk-set-preset", HTTP_POST, handleDeskSetPreset);
   server.on("/reset-amazfit", HTTP_POST, handleResetAmazfit);
 
   // Amazfit sensor endpoints
@@ -1879,6 +1945,11 @@ void handleConfig() {
   html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='3'><input type='submit' value='Preset 3 (Stand)'></form> ";
   html += "<form method='POST' action='/desk-preset' style='display:inline'><input type='hidden' name='preset' value='4'><input type='submit' value='Preset 4 (Sit)'></form>";
   html += "<p>Current Height: " + String(loctekHeight, 1) + " cm</p>";
+  html += "<br>";
+  html += "<p><strong>Set Preset:</strong> Move desk to desired height, then click Save to store it.</p>";
+  html += "<form method='POST' action='/desk-set-preset' style='display:inline'><input type='hidden' name='preset' value='1'><input type='submit' value='Save as Preset 1'></form> ";
+  html += "<form method='POST' action='/desk-set-preset' style='display:inline'><input type='hidden' name='preset' value='2'><input type='submit' value='Save as Preset 2'></form> ";
+  html += "<form method='POST' action='/desk-set-preset' style='display:inline'><input type='hidden' name='preset' value='3'><input type='submit' value='Save as Preset 3'></form>";
 
   // UART Debug Info
   unsigned long secsSinceByte = lastUartByteTime > 0 ? (millis() - lastUartByteTime) / 1000 : 0;
@@ -2180,6 +2251,31 @@ void handleDeskPreset() {
     preset = server.arg("preset").toInt();
   }
   sendDeskPreset(preset);
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskMemory() {
+  sendDeskWake();
+  delay(50);
+  sendLoctekCommand(CMD_MEMORY, CMD_LENGTH);
+  Serial.println("[Loctek] Memory (M) button sent");
+  server.sendHeader("Location", "/config");
+  server.send(303);
+}
+
+void handleDeskSetPreset() {
+  int preset = 1;
+  if (server.hasArg("preset")) {
+    preset = server.arg("preset").toInt();
+  }
+  // Send M then preset to save current height
+  sendDeskWake();
+  delay(50);
+  sendLoctekCommand(CMD_MEMORY, CMD_LENGTH);
+  delay(200);
+  sendDeskPreset(preset);
+  Serial.printf("[Loctek] Saved current height to preset %d\n", preset);
   server.sendHeader("Location", "/config");
   server.send(303);
 }
