@@ -27,6 +27,7 @@
 #define DESK_UART_TX 13   // GPIO13 - sends commands to controller (RJ45 pin 6)
 #define KEYPAD_RX 4        // GPIO4 - monitors keypad button presses (RJ45 pin 6)
 #define LOCTEK_PIN20 12    // GPIO12 - RJ45 pin 20 (controller screen enable, active HIGH)
+#define BUTTON_DOWN 22     // GPIO22 - physical button to lower desk (wire between GPIO and GND)
 
 // ==================== FORWARD DECLARATIONS ====================
 void loadConfig();
@@ -284,6 +285,7 @@ void setup() {
   pinMode(PASSIVE_BEEPER, OUTPUT);
   pinMode(PIR_PIN, INPUT);
   pinMode(LOCTEK_PIN20, OUTPUT);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
 
   digitalWrite(PASSIVE_BEEPER, LOW);
   digitalWrite(LOCTEK_PIN20, HIGH);  // Enable controller screen via RJ45 pin 20
@@ -370,6 +372,11 @@ void loop() {
 
   // Continuously read desk height data from Loctek controller
   readDeskHeight();
+
+  // Physical button on GPIO22 - lowers desk while held
+  if (digitalRead(BUTTON_DOWN) == LOW) {
+    sendLoctekCommand(CMD_DOWN, CMD_LENGTH);
+  }
 
   unsigned long currentMillis = millis();
 
