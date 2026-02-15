@@ -10,30 +10,36 @@
 
 // ==================== PIN DEFINITIONS ====================
 #define PASSIVE_BEEPER 26
-#define PIR_PIN 25
+#define PIR_PIN 25 // white to brown
 
 // OLED Display (SSD1322 SPI)
 #define SCREEN_WIDTH 256
-#define SCREEN_HEIGHT 64
-#define PIN_CS 5       // /CS
-#define PIN_DC 27      // D/C (moved from GPIO16 to free UART2)
-#define PIN_RST 33     // /RES (moved from GPIO17 to free UART2)
-#define PIN_CLK 18     // SCLK
-#define PIN_MOSI 23    // SDIN
+#define SCREEN_HEIGHT 64 
+#define PIN_CS 5       // /CS purple to blue/w
+#define PIN_DC 27      // D/C orange to blue
+#define PIN_RST 33     // /RES green to green/w
+#define PIN_CLK 18     // SCLK grey to green
+#define PIN_MOSI 23    // SDIN brown to bwron/w 
 
 // Loctek ET201-75W Desk Controller (UART via RJ45 bypass)
+
 // NOTE: GPIO16/17 cannot be used on ESP32-WROVER (PSRAM conflict)
-#define DESK_UART_RX 14   // GPIO14 - receives height data from controller (RJ45 pin 5)
-#define DESK_UART_TX 13   // GPIO13 - sends commands to controller (RJ45 pin 6)
-#define LOCTEK_PIN20 12    // GPIO12 - RJ45 pin 20 (controller screen enable, active HIGH)
+#define DESK_UART_RX 14   // Pin 5 Green TX from controller tapped
+                          // Blue - Blue D14
+#define DESK_UART_TX 13   // Pin 6 Black Rx wire from controller   
+                          // Green/w - Purple D13
+                          // Pin 6 Black RX wire from key pad      - Not Used
+                          // Blue/w - 
+#define LOCTEK_PIN20 19   // Pin 4 Red wake up - GPIO19
+                          // Green - Green D12
 
 // Physical buttons (wire each between GPIO and GND, internal pull-ups used)
 #define BUTTON_UP 4        // GPIO4
-#define BUTTON_DOWN 22     // GPIO22
-#define BUTTON_PRESET1 21  // GPIO21
-#define BUTTON_PRESET2 32  // GPIO32
-#define BUTTON_PRESET3 15  // GPIO15
-#define BUTTON_MEMORY 2    // GPIO2
+#define BUTTON_DOWN 22     // oran to blue GPIO22
+#define BUTTON_PRESET1 21  // blue/w to brown GPIO21
+#define BUTTON_PRESET2 32  // blue to green GPIO32
+#define BUTTON_PRESET3 15  // gre/w to yellow GPIO15
+#define BUTTON_MEMORY 2    // brown/w to orange GPIO2
 
 // ==================== FORWARD DECLARATIONS ====================
 void loadConfig();
@@ -705,8 +711,21 @@ void checkPresence() {
       session.sessionStartTime = millis();
       session.warningIssued = false;
 
-      // Check initial desk height
-      checkDeskHeight();
+      // Immediately detect sitting/standing position (no delay on session start)
+      float height = measureDeskHeight();
+      if (height <= 0) height = config.sittingHeightCm;
+      bool sitting = (height <= (config.sittingHeightCm + config.heightTolerance));
+      session.isSitting = sitting;
+      session.pendingPositionChange = false;
+      if (sitting) {
+        session.sittingStartTime = millis();
+        session.standingStartTime = 0;
+      } else {
+        session.standingStartTime = millis();
+        session.sittingStartTime = 0;
+      }
+      Serial.printf("Initial position: %s (height: %.1f cm)\n",
+                    sitting ? "SITTING" : "STANDING", height);
     }
   } else {
     // Check if we've exceeded PIR timeout
@@ -1395,6 +1414,8 @@ void loadConfig() {
 }
 
 void saveConfig() {
+  preferences.end();
+  preferences.begin("desk-config", false);
   preferences.putInt("sitTimeout", config.sitTimeout);
   preferences.putInt("startHour", config.operationStartHour);
   preferences.putInt("endHour", config.operationEndHour);
@@ -1488,6 +1509,8 @@ void loadStats() {
 }
 
 void saveStats() {
+  preferences.end();
+  preferences.begin("desk-config", false);
   // Daily
   preferences.putULong("dayDesk", dailyStats.totalAtDesk);
   preferences.putULong("daySit", dailyStats.totalSitting);
