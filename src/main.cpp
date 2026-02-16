@@ -30,16 +30,16 @@
                           // Green/w - Purple D13
                           // Pin 6 Black RX wire from key pad      - Not Used
                           // Blue/w - 
-#define LOCTEK_PIN20 19   // Pin 4 Red wake up - GPIO19
+#define LOCTEK_PIN20 12   // Pin 4 Red wake up
                           // Green - Green D12
 
 // Physical buttons (wire each between GPIO and GND, internal pull-ups used)
-#define BUTTON_UP 4        // GPIO4
+#define BUTTON_UP 4        // or/w to white GPIO4
 #define BUTTON_DOWN 22     // oran to blue GPIO22
 #define BUTTON_PRESET1 21  // blue/w to brown GPIO21
 #define BUTTON_PRESET2 32  // blue to green GPIO32
 #define BUTTON_PRESET3 15  // gre/w to yellow GPIO15
-#define BUTTON_MEMORY 2    // brown/w to orange GPIO2
+#define BUTTON_MEMORY 34    // brown/w to orange GPI34 with resistor to GND
 
 // ==================== FORWARD DECLARATIONS ====================
 void loadConfig();
