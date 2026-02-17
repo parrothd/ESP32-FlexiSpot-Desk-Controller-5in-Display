@@ -265,6 +265,7 @@ const unsigned long UART_DEBUG_INTERVAL = 10000; // Print UART status every 10s
 
 // Amazfit sensor data
 int steps = 0;
+unsigned long stepsLastUpdated = 0;  // epoch time when steps last updated
 int calories = 0;
 float amazfitDistance = 0.0;
 int heartRate = 0;
@@ -614,8 +615,17 @@ void displayCurrentStats() {
           formatDurationShort(displayDailyStanding).c_str());
   display.drawStr(0, 36, buf);
   
-  // Line 4: Steps
-  sprintf(buf, "Steps:%d", steps);
+  // Line 4: Steps with time since last update
+  if (stepsLastUpdated > 0) {
+    unsigned long ago = (time(nullptr) - stepsLastUpdated) / 60;  // minutes ago
+    if (ago >= 60) {
+      sprintf(buf, "Steps:%d %ldh%ldm", steps, ago / 60, ago % 60);
+    } else {
+      sprintf(buf, "Steps:%d %ldm ago", steps, ago);
+    }
+  } else {
+    sprintf(buf, "Steps:%d", steps);
+  }
   display.drawStr(0, 49, buf);
   
   // === RIGHT COLUMN (Weekly) ===
@@ -1683,6 +1693,7 @@ void handleSensorUpdate() {
 
   if (sensorName == "steps") {
     steps = stateValue.toInt();
+    stepsLastUpdated = time(nullptr);
     Serial.printf("  Steps: %d\n", steps);
   }
   else if (sensorName == "calories") {
@@ -1871,12 +1882,18 @@ void handleRoot() {
   html += "<p>Alerted: " + String(dailyStats.alertedCount) + " | ";
   html += "Forced: " + String(dailyStats.forcedStandingCount) + " | ";
   html += "Ignored: " + String(dailyStats.ignoredWarningCount) + "</p>";
-  
+  html += "<p>Steps Today: " + String(steps) + "</p>";
+
+  int daysThisWeek = timeinfo.tm_wday == 0 ? 7 : timeinfo.tm_wday;
+  int weeklyStepsTotal = weeklyTotalSteps + steps;
+  int avgSteps = weeklyStepsTotal / daysThisWeek;
+
   html += "<h2>This Week (Week " + String(weeklyStats.week) + " of " + String(weeklyStats.year) + ")</h2>";
   html += "<p>At Desk: " + formatDuration(displayWeeklyDesk) + " | ";
   html += "Sitting: " + formatDuration(displayWeeklySitting) + " | ";
   html += "Standing: " + formatDuration(displayWeeklyStanding) + "</p>";
   html += "<p>Ratio (Sit/Stand): " + formatPercentage(displayWeeklySitting, displayWeeklyStanding) + "</p>";
+  html += "<p>Steps This Week: " + String(weeklyStepsTotal) + " | Avg: " + String(avgSteps) + "/day (" + String(daysThisWeek) + " days)</p>";
   html += "<p>Alerted: " + String(weeklyStats.alertedCount) + " | ";
   html += "Forced: " + String(weeklyStats.forcedStandingCount) + " | ";
   html += "Ignored: " + String(weeklyStats.ignoredWarningCount) + "</p>";
@@ -1901,7 +1918,13 @@ void handleRoot() {
   
   html += "<hr>";
   html += "<h2>Amazfit Fitness Data</h2>";
-  html += "<p>Steps: " + String(steps) + "</p>";
+  if (stepsLastUpdated > 0) {
+    unsigned long ago = (time(nullptr) - stepsLastUpdated) / 60;
+    String agoStr = ago >= 60 ? String(ago / 60) + "h " + String(ago % 60) + "m ago" : String(ago) + " min ago";
+    html += "<p>Steps: " + String(steps) + " (" + agoStr + ")</p>";
+  } else {
+    html += "<p>Steps: " + String(steps) + "</p>";
+  }
   html += "<p>Calories: " + String(calories) + "</p>";
   html += "<p>Distance: " + String(amazfitDistance, 2) + " km</p>";
   html += "<p>Heart Rate: " + String(heartRate) + " bpm</p>";
@@ -2184,6 +2207,8 @@ void handleResetAmazfit() {
   trigger_6 = "";
   trigger_7 = "";
   as_sensor = "";
+  weeklyTotalSteps = 0;
+  stepsLastUpdated = 0;
   saveStats();
   Serial.println("Amazfit sensor data reset");
 
