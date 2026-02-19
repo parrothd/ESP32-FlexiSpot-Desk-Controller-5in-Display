@@ -27,6 +27,7 @@
 #define DESK_UART_RX 14   // Pin 5 Green TX from controller tapped
                           // Blue - Blue D14
 #define DESK_UART_TX 13   // Pin 6 Black Rx wire from controller   
+
                           // Green/w - Purple D13
                           // Pin 6 Black RX wire from key pad      - Not Used
                           // Blue/w - 
@@ -56,6 +57,7 @@ void checkPresence();
 void checkDeskHeight();
 void updateSessionTimes();
 void checkSittingTimeout();
+void flushSessionToStats();
 void finalizeSession();
 bool isOperatingHours();
 void checkDayRollover();
@@ -502,6 +504,7 @@ void loop() {
   if (currentMillis - lastStatsSave >= STATS_SAVE_INTERVAL) {
     lastStatsSave = currentMillis;
     Serial.println("=== Hourly stats save to EEPROM ===");
+    flushSessionToStats();
     saveStats();
   }
   
@@ -868,9 +871,13 @@ void checkDeskHeight() {
     session.warningIssued = false;  // Reset warning when user voluntarily stands
   }
   
+  // Save stats on position change so data survives reboots
+  flushSessionToStats();
+  saveStats();
+
   if (config.debugMode) {
     Serial.printf("Height: %.1f cm | ", height);
-    Serial.printf("Sit ref: %.1f | Stand ref: %.1f | ", 
+    Serial.printf("Sit ref: %.1f | Stand ref: %.1f | ",
                   config.sittingHeightCm, config.standingHeightCm);
     Serial.printf("Position: %s\n", session.isSitting ? "SITTING" : "STANDING");
   }
@@ -922,6 +929,8 @@ void checkSittingTimeout() {
 
     while ((millis() - waitStart) < waitDuration) {
       server.handleClient();
+      checkButtons();
+      readDeskHeight();
       checkDeskHeight();
 
       if (!session.isSitting) {
@@ -964,9 +973,9 @@ void checkSittingTimeout() {
       }
     }
 
-    // Send Loctek preset 3 (stand) to raise desk
+    // Send Loctek preset 2 (stand) to raise desk
     Serial.println("Sending Loctek stand command to force standing position...");
-    sendDeskPreset(3);
+    sendDeskPreset(2);
 
     // Increment forced standing count
     dailyStats.forcedStandingCount++;
@@ -980,17 +989,21 @@ void checkSittingTimeout() {
     unsigned long checkStart = millis();
 
     while ((millis() - checkStart) < 15000) {
-      delay(1000);  // Check every second
+      delay(100);
+      server.handleClient();
+      checkButtons();
+      readDeskHeight();
       float currentHeight = measureDeskHeight();
-      Serial.printf("Height check: %.1f cm (target: %.1f cm)\n", currentHeight, config.standingHeightCm);
+
+      if ((millis() - checkStart) % 1000 < 100) {
+        Serial.printf("Height check: %.1f cm (target: %.1f cm)\n", currentHeight, config.standingHeightCm);
+      }
 
       if (currentHeight > 0 && abs(currentHeight - config.standingHeightCm) <= config.heightTolerance) {
         reachedStanding = true;
         Serial.println("Desk successfully reached standing position");
         break;
       }
-
-      server.handleClient();  // Keep web server responsive
     }
 
     if (!reachedStanding) {
@@ -1020,51 +1033,70 @@ void checkSittingTimeout() {
   }
 }
 
+// Flush current session time into stats and reset timers to now.
+// Call this before saveStats() to ensure in-progress session data is persisted.
+void flushSessionToStats() {
+  if (!session.atDesk) return;
+
+  unsigned long now = millis();
+
+  // Flush accumulated sitting/standing from completed position changes
+  if (session.totalSessionSitting > 0) {
+    dailyStats.totalSitting += session.totalSessionSitting;
+    weeklyStats.totalSitting += session.totalSessionSitting;
+    monthlyStats.totalSitting += session.totalSessionSitting;
+    yearlyStats.totalSitting += session.totalSessionSitting;
+    session.totalSessionSitting = 0;
+  }
+  if (session.totalSessionStanding > 0) {
+    dailyStats.totalStanding += session.totalSessionStanding;
+    weeklyStats.totalStanding += session.totalSessionStanding;
+    monthlyStats.totalStanding += session.totalSessionStanding;
+    yearlyStats.totalStanding += session.totalSessionStanding;
+    session.totalSessionStanding = 0;
+  }
+
+  // Flush current continuous sitting/standing time
+  if (session.isSitting && session.sittingStartTime > 0) {
+    unsigned long sittingSecs = (now - session.sittingStartTime) / 1000;
+    dailyStats.totalSitting += sittingSecs;
+    weeklyStats.totalSitting += sittingSecs;
+    monthlyStats.totalSitting += sittingSecs;
+    yearlyStats.totalSitting += sittingSecs;
+    session.sittingStartTime = now;  // Reset to now
+  } else if (!session.isSitting && session.standingStartTime > 0) {
+    unsigned long standingSecs = (now - session.standingStartTime) / 1000;
+    dailyStats.totalStanding += standingSecs;
+    weeklyStats.totalStanding += standingSecs;
+    monthlyStats.totalStanding += standingSecs;
+    yearlyStats.totalStanding += standingSecs;
+    session.standingStartTime = now;  // Reset to now
+  }
+
+  // Flush desk time
+  if (session.sessionStartTime > 0) {
+    unsigned long deskSecs = (now - session.sessionStartTime) / 1000;
+    dailyStats.totalAtDesk += deskSecs;
+    weeklyStats.totalAtDesk += deskSecs;
+    monthlyStats.totalAtDesk += deskSecs;
+    yearlyStats.totalAtDesk += deskSecs;
+    session.sessionStartTime = now;  // Reset to now
+  }
+}
+
 void finalizeSession() {
   if (!session.atDesk) return;
-  
+
   Serial.println("\n=== FINALIZING SESSION ===");
-  
-  unsigned long sessionTime = (millis() - session.sessionStartTime) / 1000;
-  
-  // Add accumulated session sitting/standing times
-  dailyStats.totalSitting += session.totalSessionSitting;
-  weeklyStats.totalSitting += session.totalSessionSitting;
-  monthlyStats.totalSitting += session.totalSessionSitting;
-  yearlyStats.totalSitting += session.totalSessionSitting;
 
-  dailyStats.totalStanding += session.totalSessionStanding;
-  weeklyStats.totalStanding += session.totalSessionStanding;
-  monthlyStats.totalStanding += session.totalSessionStanding;
-  yearlyStats.totalStanding += session.totalSessionStanding;
+  // Flush all in-progress session time into stats
+  flushSessionToStats();
 
-  // Add current continuous sitting/standing time
-  if (session.isSitting && session.sittingStartTime > 0) {
-    unsigned long finalSitting = (millis() - session.sittingStartTime) / 1000;
-    dailyStats.totalSitting += finalSitting;
-    weeklyStats.totalSitting += finalSitting;
-    monthlyStats.totalSitting += finalSitting;
-    yearlyStats.totalSitting += finalSitting;
-  } else if (!session.isSitting && session.standingStartTime > 0) {
-    unsigned long finalStanding = (millis() - session.standingStartTime) / 1000;
-    dailyStats.totalStanding += finalStanding;
-    weeklyStats.totalStanding += finalStanding;
-    monthlyStats.totalStanding += finalStanding;
-    yearlyStats.totalStanding += finalStanding;
-  }
-  
-  // Add session time to desk time
-  dailyStats.totalAtDesk += sessionTime;
-  weeklyStats.totalAtDesk += sessionTime;
-  monthlyStats.totalAtDesk += sessionTime;
-  yearlyStats.totalAtDesk += sessionTime;
-  
-  Serial.printf("Session duration: %s\n", formatDuration(sessionTime).c_str());
   Serial.printf("Total sitting: %s\n", formatDuration(dailyStats.totalSitting).c_str());
   Serial.printf("Total standing: %s\n", formatDuration(dailyStats.totalStanding).c_str());
-  
+
   saveStats();
-  
+
   Serial.println("Session finalized and saved");
 }
 
