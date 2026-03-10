@@ -1306,6 +1306,15 @@ void checkDayRollover() {
   }
   
   if (dailyStats.date == 0) {
+    // If stats have data but no saved date, the date save failed previously.
+    // Reset to avoid carrying stale data into the wrong day.
+    bool hasData = (dailyStats.totalAtDesk > 0 || dailyStats.totalSitting > 0 || dailyStats.totalStanding > 0);
+    if (hasData) {
+      Serial.println("=== Day date missing but stats have data - resetting daily stats ===");
+      weeklyTotalSteps += steps;
+      steps = 0;
+      resetDailyStats();
+    }
     dailyStats.date = currentDate;
     saveStats();
   }
@@ -1340,6 +1349,13 @@ void checkWeekRollover() {
   }
   
   if (weeklyStats.week == 0) {
+    // If stats have data but no saved week, the week save failed previously.
+    // Reset to avoid carrying stale data into the wrong week.
+    bool hasData = (weeklyStats.totalAtDesk > 0 || weeklyStats.totalSitting > 0 || weeklyStats.totalStanding > 0 || weeklyTotalSteps > 0);
+    if (hasData) {
+      Serial.println("=== Week number missing but stats have data - resetting weekly stats ===");
+      resetWeeklyStats();
+    }
     weeklyStats.week = currentWeek;
     weeklyStats.year = currentYear;
     weeklyStats.month = currentMonth;
