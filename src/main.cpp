@@ -574,10 +574,6 @@ void displayCurrentStats() {
   
   // Add current session to display totals
   if (session.atDesk) {
-    unsigned long currentSessionTime = (millis() - session.sessionStartTime) / 1000;
-    displayDailyDesk += currentSessionTime;
-    displayWeeklyDesk += currentSessionTime;
-
     // Add accumulated session sitting/standing times
     displayDailySitting += session.totalSessionSitting;
     displayWeeklySitting += session.totalSessionSitting;
@@ -595,6 +591,10 @@ void displayCurrentStats() {
       displayWeeklyStanding += currentStanding;
     }
   }
+
+  // Desk time = sit + stand (always in sync)
+  displayDailyDesk = displayDailySitting + displayDailyStanding;
+  displayWeeklyDesk = displayWeeklySitting + displayWeeklyStanding;
   
   // Get current time for day display
   time_t now = time(nullptr) + CST_OFFSET;
@@ -632,9 +632,16 @@ void displayCurrentStats() {
   display.drawStr(0, 49, buf);
   
   // === RIGHT COLUMN (Weekly) ===
-  // Line 1: Week: month/week
-  sprintf(buf, "Week:%d/W%d", 
-          weeklyStats.month, weeklyStats.week);
+  // Line 1: Week: month/week + uptime
+  {
+    unsigned long uptimeSecs = millis() / 1000;
+    unsigned long uptimeDays = uptimeSecs / 86400;
+    unsigned long uptimeHrs  = (uptimeSecs % 86400) / 3600;
+    unsigned long uptimeMins = (uptimeSecs % 3600) / 60;
+    sprintf(buf, "Week:%d/W%d %lu:%02lu:%02lu",
+            weeklyStats.month, weeklyStats.week,
+            uptimeDays, uptimeHrs, uptimeMins);
+  }
   display.drawStr(128, 10, buf);
   
   // Line 2: Average @Desk time per day this week
@@ -871,9 +878,8 @@ void checkDeskHeight() {
     session.warningIssued = false;  // Reset warning when user voluntarily stands
   }
   
-  // Save stats on position change so data survives reboots
+  // Flush session into stats on position change (memory only, no NVS write)
   flushSessionToStats();
-  saveStats();
 
   if (config.debugMode) {
     Serial.printf("Height: %.1f cm | ", height);
@@ -1075,13 +1081,14 @@ void flushSessionToStats() {
 
   // Flush desk time
   if (session.sessionStartTime > 0) {
-    unsigned long deskSecs = (now - session.sessionStartTime) / 1000;
-    dailyStats.totalAtDesk += deskSecs;
-    weeklyStats.totalAtDesk += deskSecs;
-    monthlyStats.totalAtDesk += deskSecs;
-    yearlyStats.totalAtDesk += deskSecs;
     session.sessionStartTime = now;  // Reset to now
   }
+
+  // Derive totalAtDesk from sit + stand so they always match
+  dailyStats.totalAtDesk = dailyStats.totalSitting + dailyStats.totalStanding;
+  weeklyStats.totalAtDesk = weeklyStats.totalSitting + weeklyStats.totalStanding;
+  monthlyStats.totalAtDesk = monthlyStats.totalSitting + monthlyStats.totalStanding;
+  yearlyStats.totalAtDesk = yearlyStats.totalSitting + yearlyStats.totalStanding;
 }
 
 void finalizeSession() {
@@ -1567,8 +1574,6 @@ void loadStats() {
 }
 
 void saveStats() {
-  preferences.end();
-  preferences.begin("desk-config", false);
   // Daily
   preferences.putULong("dayDesk", dailyStats.totalAtDesk);
   preferences.putULong("daySit", dailyStats.totalSitting);
@@ -1876,12 +1881,16 @@ void handleRoot() {
   
   // Add current session if at desk
   if (session.atDesk) {
-    unsigned long currentSessionTime = (millis() - session.sessionStartTime) / 1000;
-    displayDailyDesk += currentSessionTime;
-    displayWeeklyDesk += currentSessionTime;
-    displayMonthlyDesk += currentSessionTime;
-    displayYearlyDesk += currentSessionTime;
-    
+    // Add accumulated session sitting/standing times
+    displayDailySitting += session.totalSessionSitting;
+    displayWeeklySitting += session.totalSessionSitting;
+    displayMonthlySitting += session.totalSessionSitting;
+    displayYearlySitting += session.totalSessionSitting;
+    displayDailyStanding += session.totalSessionStanding;
+    displayWeeklyStanding += session.totalSessionStanding;
+    displayMonthlyStanding += session.totalSessionStanding;
+    displayYearlyStanding += session.totalSessionStanding;
+
     if (session.isSitting && session.sittingStartTime > 0) {
       unsigned long currentSitting = (millis() - session.sittingStartTime) / 1000;
       displayDailySitting += currentSitting;
@@ -1896,10 +1905,26 @@ void handleRoot() {
       displayYearlyStanding += currentStanding;
     }
   }
+
+  // Desk time = sit + stand (always in sync)
+  displayDailyDesk = displayDailySitting + displayDailyStanding;
+  displayWeeklyDesk = displayWeeklySitting + displayWeeklyStanding;
+  displayMonthlyDesk = displayMonthlySitting + displayMonthlyStanding;
+  displayYearlyDesk = displayYearlySitting + displayYearlyStanding;
   
   String html = "<html><body>";
   html += "<h1>Smart Standing Desk Monitor</h1>";
-  
+
+  {
+    unsigned long uptimeSecs = millis() / 1000;
+    unsigned long uptimeDays = uptimeSecs / 86400;
+    unsigned long uptimeHrs  = (uptimeSecs % 86400) / 3600;
+    unsigned long uptimeMins = (uptimeSecs % 3600) / 60;
+    char uptimeBuf[32];
+    sprintf(uptimeBuf, "%lu:%02lu:%02lu", uptimeDays, uptimeHrs, uptimeMins);
+    html += "<p>Uptime: " + String(uptimeBuf) + "</p>";
+  }
+
   html += "<h2>Current Status</h2>";
   html += "<p>Status: " + String(session.atDesk ? "AT DESK" : "AWAY") + "</p>";
   
