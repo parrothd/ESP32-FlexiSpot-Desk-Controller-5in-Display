@@ -15,8 +15,6 @@ Some FlexiSpot models have a second RJ45 port on the controller — there are co
 
 Code:
 All code was written by Claude AI. If you want to switch back to the ultrasonic sensor method or use the second-port approach instead, just ask Claude to swap it out.
-Code:
-All code was written by Claude AI. To switch from direct control to the distance sensor method, just ask Claude to remove the direct control logic and replace it with the ultrasonic sensor alternative.
 
 HiLetgo 3pcs AM312 Mini Pyroelectric PIR Human Sensor Module PIR Infrared IR Sensor Body Manual Motion Infrared IR Detector
 HC-SR04P Ultrasonic Distance Sensor Module with 3V to 5.5V Wide Voltage, 2cm–450cm Range, 4-Pin Interface Compatible with Arduino and Raspberry Pi
