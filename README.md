@@ -19,13 +19,16 @@ Some FlexiSpot models have a second RJ45 port on the controller — there are co
 Code:
 All code was written by Claude AI. If you want to switch back to the ultrasonic sensor method or use the second-port approach instead, just ask Claude to swap it out.
 
+Parts
 HiLetgo 3pcs AM312 Mini Pyroelectric PIR Human Sensor Module PIR Infrared IR Sensor Body Manual Motion Infrared IR Detector
 HC-SR04P Ultrasonic Distance Sensor Module with 3V to 5.5V Wide Voltage, 2cm–450cm Range, 4-Pin Interface Compatible with Arduino and Raspberry Pi
 
 Displays
 1/3PCS 5.5 Inch OLED LCD display green color 256x64 Drive SSD1322 interface SPI/ 8-bit Parallel Port For Arduino UNO R3
 https://www.aliexpress.us/item/3256808557280461.html?spm=a2g0o.order_detail.order_detail_item.2.5fb6f19c4ly8KW&gatewayAdapt=glo2usa
+
 or
+
 2pcs 3.12 inch OLED Display 256x64 OLED LCD Display SSD1322 Module 16pin Parallel SPI Soldering for Arduino (Yellow)
 https://www.amazon.com/dp/B0F7L9PLRM?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_3&th=1
 Pin 1 - GND, Pin2 VCC, Pin 4, CLK, Pin 5 DIN, Pin 14 DC, Pin
