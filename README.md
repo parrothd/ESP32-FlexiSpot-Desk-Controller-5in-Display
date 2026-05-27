@@ -9,6 +9,8 @@ Controls the desk height remotely via web interface
 Moves the desk on a timer/schedule
 Reports sitting vs. standing state & Steps to a display
 Steps is handled from my amazfit 7 watch -> notify for andriod -> mqtt to esp32 -> display
+Saves everything via Eeprom
+Wifi is configurable
 
 How it works:
 The ESP32 is wired in bypass mode, taking over the desk's control bus directly. Originally, standing vs. sitting detection was handled by an ultrasonic distance sensor — this is still supported and is the simpler option. The current implementation uses the bypass wiring to determine desk position directly.
