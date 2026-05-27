@@ -1,11 +1,14 @@
 ESP32 FlexiSpot Desk Controller & Display
+<img width="3000" height="4000" alt="20260526_131311" src="https://github.com/user-attachments/assets/bdc43e7d-c3cd-4f41-8d4a-c54d5f0c9ae2" />
 
-This project uses an ESP32 to replace a dead FlexiSpot controller — I fried my original, so the ESP32 takes over completely.
+
+This project uses an ESP32 to replace a dead FlexiSpot controller — Added a display to track my sitting vs standing and stats.
 What it does:
 
 Controls the desk height remotely via web interface
 Moves the desk on a timer/schedule
-Reports sitting vs. standing state to a display
+Reports sitting vs. standing state & Steps to a display
+Steps is handled from my amazfit 7 watch -> notify for andriod -> mqtt to esp32 -> display
 
 How it works:
 The ESP32 is wired in bypass mode, taking over the desk's control bus directly. Originally, standing vs. sitting detection was handled by an ultrasonic distance sensor — this is still supported and is the simpler option. The current implementation uses the bypass wiring to determine desk position directly.
